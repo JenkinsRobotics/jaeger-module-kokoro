@@ -5,15 +5,16 @@
 # these topic names do not exist in, and the mismatch would surface as a
 # node that subscribes successfully and then never receives anything.
 #
-# Pointed at the branch carrying the contract until a release is cut.
-# ACTION REQUIRED: move this to the tag when JaegerOS tags the
-# hierarchy. A dev clone with a sibling ~/GITHUB/JaegerOS checkout gets
-# an editable install instead and is unaffected.
+# The hierarchy is merged to master (JaegerOS 0.10.0) but NOT TAGGED.
+# ACTION REQUIRED: move this to @0.10.0 when that tag is cut —
+# @master is a moving target and a deployed station must never pin
+# one. A dev clone with a sibling ~/GITHUB/JaegerOS checkout gets an
+# editable install instead and is unaffected.
 #
 # PEP 508 direct reference, not `-e ../JaegerOS`: setuptools' dynamic-
 # dependencies file parser accepts requirement specifiers only, never
 # pip's `-e`/`-r` directives.
-jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@jaeger-animation
+jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@master
 
 # --- the Kokoro engine itself ---
 kokoro>=0.9.4
