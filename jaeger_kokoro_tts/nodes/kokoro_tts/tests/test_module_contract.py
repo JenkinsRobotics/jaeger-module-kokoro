@@ -38,8 +38,15 @@ def test_module_yaml_validates() -> None:
     assert doc["module"] == "kokoro_tts"
     assert doc["slot"] == "tts"
     assert doc["version"] == "1.0.0"
-    assert doc["consumes"] == ["/act/speech/say", "/act/speech/stop"]
-    assert doc["produces"] == ["/act/speech/spoken", "/act/speech/chunk"]
+    # /act/speaker/* joined the surface when this module stopped
+    # opening the output device: it publishes audio for the audio_io
+    # driver to play, and listens for the driver's drain signal because
+    # a publisher cannot tell "finished sending" from "finished
+    # playing" on its own.
+    assert doc["consumes"] == ["/act/speech/say", "/act/speech/stop",
+                               "/act/speaker/state"]
+    assert doc["produces"] == ["/act/speech/spoken", "/act/speech/chunk",
+                               "/act/speaker/pcm", "/act/speaker/stop"]
     assert doc["tools"] == ["text_to_speech"]
     assert doc["factory"] == "jaeger_kokoro_tts.nodes.kokoro_tts:make_tts_node"
     assert doc["config"] == "kokoro_tts"

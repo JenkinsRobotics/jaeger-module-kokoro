@@ -14,8 +14,20 @@ kind: engine
 # coming back — so subscribing to /act/speech/ shows the whole
 # conversation. A system with two voices instances them as
 # /act/speech/voice0/say and /act/speech/voice1/say.
-consumes: [/act/speech/say, /act/speech/stop]
-produces: [/act/speech/spoken, /act/speech/chunk]
+#
+# This module NO LONGER OPENS THE SPEAKER. It publishes synthesised
+# audio on /act/speaker/pcm and jaeger_os.nodes.audio_io plays it —
+# which is what lets the wake chimes share the same device (they were
+# always a second producer, each opening it independently), and what
+# gives the echo canceller the played audio for free.
+#
+# /act/speaker/state is the price of that: a publisher cannot tell
+# "my audio finished being SENT" from "my audio finished PLAYING", and
+# only the device knows the second. The done-ack on
+# /act/speech/spoken waits for it.
+consumes: [/act/speech/say, /act/speech/stop, /act/speaker/state]
+produces: [/act/speech/spoken, /act/speech/chunk,
+           /act/speaker/pcm, /act/speaker/stop]
 tools: [text_to_speech]
 factory: jaeger_kokoro_tts.nodes.kokoro_tts:make_tts_node
 config: kokoro_tts        # its group/key in the settings catalog

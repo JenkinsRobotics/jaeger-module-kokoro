@@ -292,6 +292,7 @@ class KokoroTTS:
         *,
         voice: str = KOKORO_VOICE,
         lang: str = KOKORO_LANG,
+        bus: Any = None,
         reference_buffer: FarEndReference | None = None,
     ) -> None:
         self.voice = voice
@@ -307,6 +308,10 @@ class KokoroTTS:
         # only when barge-in + AEC are actually wanted); left ``None``
         # this engine simply doesn't publish a far-end reference and
         # plain set_paused()-based playback still works.
+        self.bus = bus
+        # Only used on the no-bus path. With a bus, the audio_io driver
+        # writes its own AEC reference from what it actually plays,
+        # which is both simpler and more accurate than us guessing.
         self.reference_buffer = reference_buffer
         # 0.3.0-refactor step 1+2: ONE long-lived output stream for the
         # whole TTS lifetime.  Backend chosen at runtime from
@@ -317,8 +322,15 @@ class KokoroTTS:
         #     dev/tools/audio_smoke/voice_assistant_avaudio.py
         # Lazy-opened by ``_ensure_player`` from ``warm()``; closed by
         # ``shutdown()`` at TUI exit.
-        from .persistent_player import PersistentKokoroPlayer
-        self._PlayerCls = PersistentKokoroPlayer
+        # With a bus: publish to /act/speaker/pcm and let the audio_io
+        # driver own the device. Without one: open the device directly,
+        # which is what dev tools and benches do.
+        if bus is not None:
+            from .bus_player import BusPlayer
+            self._PlayerCls = BusPlayer
+        else:
+            from .persistent_player import PersistentKokoroPlayer
+            self._PlayerCls = PersistentKokoroPlayer
         self._player: Any = None
         # Operator can override the config-default backend at runtime
         # via ``JAEGER_AUDIO_BACKEND`` for quick A/B testing without
@@ -362,10 +374,12 @@ class KokoroTTS:
         if self._player is not None and self._player.is_open():
             return self._player
         backend = self._resolve_backend()
-        self._player = self._PlayerCls(
-            backend=backend,
-            samplerate=KOKORO_SAMPLE_RATE, channels=1,
-        )
+        kwargs = dict(backend=backend, samplerate=KOKORO_SAMPLE_RATE,
+                      channels=1)
+        if self.bus is not None:
+            kwargs["bus"] = self.bus
+            kwargs["backend"] = "bus"
+        self._player = self._PlayerCls(**kwargs)
         self._player.start()
         print(f"[kokoro] persistent output stream open → "
               f"backend={backend!r} device={self._player.device_index} "
@@ -600,7 +614,10 @@ class KokoroTTS:
             nonlocal queued_samples
             if chunk_24k.size == 0:
                 return
-            if self.reference_buffer is not None:
+            # On the bus path the driver writes its own reference from
+            # what it actually plays; writing one here as well would
+            # double-count the far end.
+            if self.bus is None and self.reference_buffer is not None:
                 try:
                     ref = _resample_to_reference_rate(chunk_24k)
                     self.reference_buffer.write(ref)
