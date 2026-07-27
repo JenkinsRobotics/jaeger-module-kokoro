@@ -1,8 +1,21 @@
 module: kokoro_tts
 slot: tts
 version: 1.0.0
-consumes: [/act/speech, /act/speech_stop]
-produces: [/sense/spoken, /sense/tts_chunk]
+
+# The OWNERSHIP axis (TAXONOMY.md "Module KINDS") — orthogonal to
+# `slot`, which says what ROLE this fills. `engine` is the kind that
+# fills a capability slot; swapping in Piper or a cloud TTS means
+# swapping this module, not editing anything that talks to it.
+kind: engine
+
+# Topics follow the hierarchy: /<category>/<class>/<message>, with an
+# optional instance segment. Everything about the speech device lives
+# under one prefix — the request, the audio in flight, and the done-ack
+# coming back — so subscribing to /act/speech/ shows the whole
+# conversation. A system with two voices instances them as
+# /act/speech/voice0/say and /act/speech/voice1/say.
+consumes: [/act/speech/say, /act/speech/stop]
+produces: [/act/speech/spoken, /act/speech/chunk]
 tools: [text_to_speech]
 factory: jaeger_kokoro_tts.nodes.kokoro_tts:make_tts_node
 config: kokoro_tts        # its group/key in the settings catalog

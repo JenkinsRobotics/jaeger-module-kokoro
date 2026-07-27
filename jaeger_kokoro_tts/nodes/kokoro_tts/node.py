@@ -1,9 +1,9 @@
 """tts.py — TTS node.  First Track B node.
 
 Wraps the existing in-process :class:`KokoroTTS` engine as a Bus-
-addressable node.  Subscribes to ``/act/speech`` (the brain's
+addressable node.  Subscribes to ``/act/speech/say`` (the brain's
 text-to-speech command topic), runs synthesis + playback on the
-node's own work thread, and publishes ``/sense/spoken`` as the ack
+node's own work thread, and publishes ``/act/speech/spoken`` as the ack
 the brain's ``text_to_speech`` tool will await (Track B.2).
 
 Why this is the right "first real node"
@@ -15,7 +15,7 @@ Why this is the right "first real node"
 * No mic / STT involvement — half the audio pipeline isolated from
   the change.
 * Doesn't touch the brain or voice loop in this commit; Track B.2
-  is the brain-side rewire (text_to_speech tool publishes /act/speech
+  is the brain-side rewire (text_to_speech tool publishes /act/speech/say
   via the bus instead of calling speak() in-process).
 
 Threading
@@ -68,7 +68,7 @@ class Synthesizer(Protocol):
 
 
 class TTSNode(Node):
-    """SUB ``/act/speech`` → synthesize → PUB ``/sense/spoken``.
+    """SUB ``/act/speech/say`` → synthesize → PUB ``/act/speech/spoken``.
 
     The synthesizer is dependency-injected so tests can substitute a
     mock without touching audio or model loading.  Production
@@ -105,10 +105,10 @@ class TTSNode(Node):
     # ── lifecycle ─────────────────────────────────────────────────
 
     def setup(self) -> None:
-        self.bus.subscribe(topics.ACT_SPEECH, self._on_speech_command)
+        self.bus.subscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
         self.bus.subscribe(topics.ACT_SPEECH_STOP, self._on_speech_stop)
         self._log(
-            f"subscribed to {topics.ACT_SPEECH} + {topics.ACT_SPEECH_STOP}"
+            f"subscribed to {topics.ACT_SPEECH_SAY} + {topics.ACT_SPEECH_STOP}"
         )
 
     def tick(self) -> None:
@@ -123,7 +123,7 @@ class TTSNode(Node):
 
     def teardown(self) -> None:
         try:
-            self.bus.unsubscribe(topics.ACT_SPEECH, self._on_speech_command)
+            self.bus.unsubscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -202,7 +202,7 @@ class TTSNode(Node):
     def _handle(self, msg: topics.SpeechCommand) -> None:
         t0 = time.perf_counter()
         self._active_correlation_id = msg.correlation_id
-        # 0.5 lip-sync proxy: emit /sense/tts_chunk events at ~30 Hz
+        # 0.5 lip-sync proxy: emit /act/speech/chunk events at ~30 Hz
         # while the synthesizer runs.  Amplitude is a sin-wave
         # placeholder; real RMS sampling is a 0.5.x followup once
         # Kokoro exposes streaming audio.
@@ -257,7 +257,7 @@ class TTSNode(Node):
         stop_event: threading.Event,
         correlation_id: str,
     ) -> None:
-        """Emit ``/sense/tts_chunk`` events at ~30 Hz with a sin
+        """Emit ``/act/speech/chunk`` events at ~30 Hz with a sin
         amplitude shape until ``stop_event`` is set.
 
         0.5.0 lip-sync proxy: not real audio sampling, but a

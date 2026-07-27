@@ -38,8 +38,8 @@ def test_module_yaml_validates() -> None:
     assert doc["module"] == "kokoro_tts"
     assert doc["slot"] == "tts"
     assert doc["version"] == "1.0.0"
-    assert doc["consumes"] == ["/act/speech", "/act/speech_stop"]
-    assert doc["produces"] == ["/sense/spoken", "/sense/tts_chunk"]
+    assert doc["consumes"] == ["/act/speech/say", "/act/speech/stop"]
+    assert doc["produces"] == ["/act/speech/spoken", "/act/speech/chunk"]
     assert doc["tools"] == ["text_to_speech"]
     assert doc["factory"] == "jaeger_kokoro_tts.nodes.kokoro_tts:make_tts_node"
     assert doc["config"] == "kokoro_tts"
@@ -88,7 +88,7 @@ def test_speak_round_trip_with_a_fake_synth() -> None:
 
         ack = bus.request(
             topics.SpeechCommand(text="module contract smoke"),
-            ack_topic=topics.SENSE_SPOKEN,
+            ack_topic=topics.ACT_SPEECH_SPOKEN,
             timeout_s=2.0,
         )
         assert ack is not None

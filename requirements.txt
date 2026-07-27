@@ -1,19 +1,19 @@
-# JaegerKokoroTTS runtime dependencies.
+# --- framework (git dependency — JaegerOS has no PyPI releases yet) ---
+# REQUIRES the hierarchical topic contract. This module's module.yaml
+# declares /<category>/<class>/<message> paths, which the 0.9.0 tag does
+# NOT carry — pinning that tag would install a framework whose contract
+# these topic names do not exist in, and the mismatch would surface as a
+# node that subscribes successfully and then never receives anything.
 #
-# Engine-tier only — pins jaeger-os (framework substrate: transport,
-# nodes.base, core.audio, core.instance.setting_meta) and the Kokoro
-# engine's own third-party libraries. NEVER jaeger-ai — see
-# module.yaml's requires_libraries for the exact probe set the
-# availability gate checks.
-
-# --- framework (git dependency — JaegerOS has no PyPI releases yet).
-# PEP 508 direct reference, not `-e ../JaegerOS` — setuptools' dynamic-
-# dependencies file parser only accepts requirement specifiers, not
-# pip's `-e`/`-r` directives. Pinned to @master for 0.9; switch to a
-# tag pin (e.g. @0.9.0) once JaegerOS cuts a release tag. A dev clone
-# with a sibling ~/GITHUB/JaegerOS checkout gets an editable install
-# instead — see JaegerAI's install.sh sibling-detection step. ---
-jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@0.9.0
+# Pointed at the branch carrying the contract until a release is cut.
+# ACTION REQUIRED: move this to the tag when JaegerOS tags the
+# hierarchy. A dev clone with a sibling ~/GITHUB/JaegerOS checkout gets
+# an editable install instead and is unaffected.
+#
+# PEP 508 direct reference, not `-e ../JaegerOS`: setuptools' dynamic-
+# dependencies file parser accepts requirement specifiers only, never
+# pip's `-e`/`-r` directives.
+jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@jaeger-animation
 
 # --- the Kokoro engine itself ---
 kokoro>=0.9.4

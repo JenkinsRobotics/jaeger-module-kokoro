@@ -35,7 +35,7 @@ consumers today: the JaegerAI product and JP01's non-AI console.
   from `KokoroTTS` (the real engine) behind a small protocol, so a
   future sibling module (e.g. a different TTS backend) can bind the
   same `tts` slot without touching the node.
-- **Bus contract** — `/act/speech` in, `/sense/spoken` + `/sense/tts_chunk`
+- **Bus contract** — `/act/speech/say` in, `/act/speech/spoken` + `/act/speech/chunk`
   out, the `text_to_speech` tool. Declared once, in `module.yaml` —
   nowhere else.
 
