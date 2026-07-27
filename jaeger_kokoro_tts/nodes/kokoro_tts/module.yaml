@@ -1,6 +1,6 @@
 module: kokoro_tts
 slot: tts
-version: 1.0.0
+version: 2.0.0
 
 # The OWNERSHIP axis (TAXONOMY.md "Module KINDS") — orthogonal to
 # `slot`, which says what ROLE this fills. `engine` is the kind that

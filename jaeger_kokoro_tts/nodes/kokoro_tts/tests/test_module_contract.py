@@ -37,7 +37,11 @@ def test_module_yaml_validates() -> None:
     doc = yaml.safe_load((_MODULE_DIR / "module.yaml").read_text())
     assert doc["module"] == "kokoro_tts"
     assert doc["slot"] == "tts"
-    assert doc["version"] == "1.0.0"
+    # 2.0.0: the topic rename is a breaking contract change, and
+    # module.yaml's own rule calls for a MAJOR bump on one. Anything
+    # pinning 1.x targets the flat namespace and will not find these
+    # topics.
+    assert doc["version"] == "2.0.0"
     # /act/speaker/* joined the surface when this module stopped
     # opening the output device: it publishes audio for the audio_io
     # driver to play, and listens for the driver's drain signal because
