@@ -54,3 +54,19 @@ markers = [
     "slow: tests that fork real processes or do real network I/O.",
     "model: tests that load the real Kokoro model weights.",
 ]
+
+[project.optional-dependencies]
+# For a machine with NO framework installed. JaegerOS is not on PyPI,
+# so `jaeger-os>=0.10` alone cannot resolve from nothing.
+#
+# Kept OPTIONAL on purpose: a URL dependency forces pip to reinstall
+# that exact source even when a newer, satisfying jaeger-os is already
+# present. As a normal dependency that silently downgrades the
+# framework under a running app. As an extra, you only get it when you
+# ASK for it, which is exactly when you have nothing to lose.
+#
+#   pip install -e .              framework already present
+#   pip install -e ".[bootstrap]" fresh machine
+bootstrap = [
+  "jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@master",
+]
