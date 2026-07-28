@@ -1,20 +1,20 @@
-# --- framework (git dependency — JaegerOS has no PyPI releases yet) ---
-# REQUIRES the hierarchical topic contract. This module's module.yaml
-# declares /<category>/<class>/<message> paths, which the 0.9.0 tag does
-# NOT carry — pinning that tag would install a framework whose contract
-# these topic names do not exist in, and the mismatch would surface as a
-# node that subscribes successfully and then never receives anything.
+# ── the framework ────────────────────────────────────────────────
+# A VERSION SPEC, not a git URL, and the difference is not cosmetic.
+# A URL pin forces pip to reinstall that exact source even when a
+# newer, satisfying jaeger-os is already present — so installing this
+# module would DOWNGRADE the framework under a running app and take
+# its topics with it.
 #
-# The hierarchy is merged to master (JaegerOS 0.10.0) but NOT TAGGED.
-# ACTION REQUIRED: move this to @0.10.0 when that tag is cut —
-# @master is a moving target and a deployed station must never pin
-# one. A dev clone with a sibling ~/GITHUB/JaegerOS checkout gets an
-# editable install instead and is unaffected.
+# A version spec leaves a satisfying install alone. If nothing
+# satisfies it, pip says so plainly and setup.sh (or the README) says
+# where to get it: JaegerOS is not on PyPI yet.
 #
-# PEP 508 direct reference, not `-e ../JaegerOS`: setuptools' dynamic-
-# dependencies file parser accepts requirement specifiers only, never
-# pip's `-e`/`-r` directives.
-jaeger-os @ git+https://github.com/JenkinsRobotics/JaegerOS@master
+#   pip install "jaeger-os>=0.10
+#
+# REQUIRES the hierarchical topic contract. Below 0.10 the topics this
+# module declares do not exist, and the failure is a node that
+# subscribes fine and then never receives anything.
+jaeger-os>=0.10
 
 # --- the Kokoro engine itself ---
 kokoro>=0.9.4
