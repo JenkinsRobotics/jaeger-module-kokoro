@@ -141,3 +141,31 @@ def test_declared_libraries_are_importable() -> None:
         pytest.skip(f"not installed here, cannot verify: {missing}")
     # An EMPTY list is legitimate — a stdlib-only module (imessage
     # drives AppleScript and imports nothing third-party) declares none.
+
+def test_a_driver_declares_whether_its_device_is_reachable() -> None:
+    """`kind: driver` must override `Node.link_ok()`.
+
+    The failure it prevents produces no symptom: a driver whose link
+    dies keeps ticking and reports RUNNING forever, because the tick
+    loop is fine. Nothing else in the system can tell that the device
+    is gone.
+
+    Only drivers are held to this — a processing or engine module owns
+    no device, and the default `link_ok() -> None` is correct for them.
+    """
+    if MANIFEST.get("kind") != "driver":
+        pytest.skip("not a driver-kind module")
+
+    import importlib
+
+    from jaeger_os.nodes.base import Node
+
+    dotted, _, attr = MANIFEST["factory"].partition(":")
+    factory = getattr(importlib.import_module(dotted), attr)
+    node_cls = getattr(factory, "__node_class__", None)
+    if node_cls is None:
+        pytest.skip("factory does not advertise its node class "
+                    "(set factory.__node_class__ to enable this gate)")
+    assert node_cls.link_ok is not Node.link_ok, (
+        f"{node_cls.__name__} is kind: driver and does not override "
+        f"link_ok() — a dead device link would report healthy forever")
