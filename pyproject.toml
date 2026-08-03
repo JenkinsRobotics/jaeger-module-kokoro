@@ -41,27 +41,28 @@ dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
 include = ["jaeger_kokoro_tts*"]
+# Tests are not part of the distribution. They are also the largest
+# source of generated __pycache__, so excluding them keeps bytecode out
+# of the wheel for free.
+exclude = ["jaeger_kokoro_tts.tests*"]
 
 [tool.setuptools.package-data]
-# Non-.py assets under the package (module.yaml at minimum) — setuptools
-# only auto-includes .py files for a found package; everything else
-# needs an explicit glob or it silently vanishes from a REAL (non
-# -editable) install. Caught via a real git-dependency install (`pip
-# install jaeger-kokoro-tts @ git+...`): editable installs mask this
-# because they point back at the source tree, module.yaml "works" by
-# accident. "**/*" is deliberately broad (redundant with .py, harmless)
-# rather than an extension allowlist that silently misses the next
-# asset type this module grows.
-jaeger_kokoro_tts = ["**/*"]
-
-[tool.setuptools.exclude-package-data]
-# ...but "**/*" also swept up __pycache__, so the 0.12.0 wheel shipped
-# 20 .pyc files including pytest-versioned test bytecode. A .pyc whose
-# .py it no longer matches is importable, which makes this a stale-code
-# hazard rather than just weight. Broad include + narrow exclude keeps
-# the property the comment above wants (the next asset type ships
-# automatically) without shipping build droppings.
-"*" = ["__pycache__/*", "*.pyc", "*.pyo"]
+# module.yaml is not a .py file, so setuptools does NOT pick it up
+# automatically — it ships only because this line says so. An editable
+# install masks its absence completely: the import path points back at
+# the source tree, so the manifest "works" by accident and every local
+# test passes. The failure appears only in a REAL install (`pip install
+# jaeger-kokoro-tts @ git+...`), where the module imports fine, claims no
+# slot, and the app boots one node short with no error.
+#
+# ALLOWLIST, not a recursive glob. This was `["**/*"]` plus an
+# exclude-package-data block undoing it; the glob swept __pycache__ into
+# the wheel — measured at 12 .pyc files including pytest-versioned test
+# bytecode. A .pyc whose .py no longer matches is still importable, so
+# that is a stale-code hazard, not just weight. Naming the assets is
+# shorter than sweeping and then subtracting, and it makes the artifact
+# reproducible. Add real assets here as the module grows them.
+jaeger_kokoro_tts = ["module.yaml"]
 
 [tool.pytest.ini_options]
 # One location. `dev/tests` went away in the 0.12.0 flattening —
