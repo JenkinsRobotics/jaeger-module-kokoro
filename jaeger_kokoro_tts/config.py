@@ -1,12 +1,9 @@
-"""jaeger_kokoro_tts.nodes.kokoro_tts.config — the module's own settings-catalog
-schema slice.
+"""Operator-facing configuration for the Kokoro TTS module.
 
-0.8 M1: "the module IS the engine" — its config schema lives beside its
-node/engine code, not in ``core/instance/schemas.py``. It's nested into
-the central ``Config`` model as ``Config.kokoro_tts`` (one line in
-``schemas.py``); the settings-catalog walk (``core/settings/catalog.py``)
-then renders the ``kokoro_tts`` group automatically — zero catalog-side
-edits, matching ``module.yaml``'s ``config: kokoro_tts`` pointer.
+Kokoro always emits 24 kHz mono audio. That fact is a module constant, not
+an editable quality control; exposing it as configuration previously made
+it possible to label 24 kHz samples as another rate and produce slow,
+fast, or pitched playback.
 
 Voice resolution order is unchanged from pre-0.8: the active character's
 / instance's ``Identity.voice_id`` wins when set; ``voice`` below is only
@@ -30,10 +27,7 @@ from jaeger_os.core.instance.setting_meta import _setting
 
 
 class KokoroTTSConfig(BaseModel):
-    """Settings-catalog-visible defaults for the ``kokoro_tts`` engine
-    module. All three fields are exposed under the ``kokoro_tts`` group
-    the moment this model is nested into ``Config`` — no catalog code
-    changes needed (see module docstring)."""
+    """Validated defaults shown in the ``kokoro_tts`` settings group."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -53,15 +47,20 @@ class KokoroTTSConfig(BaseModel):
         description="Kokoro KPipeline language code ('a' = American "
                     "English — see the kokoro library for the full set).",
     )
-    sample_rate: int = Field(
-        24000, ge=8000, le=48000,
+    warm: bool = Field(
+        True,
         json_schema_extra=_setting("kokoro_tts", advanced=True),
-        description=(
-            "Kokoro's native output sample rate (Hz). This must match "
-            "what the loaded Kokoro model actually produces — it is NOT "
-            "a free-form audio-quality knob; changing it without a "
-            "matching model change will distort playback."
-        ),
+        description="Load and prime Kokoro in the background at node start.",
+    )
+    queue_maxsize: int = Field(
+        32, ge=1, le=256,
+        json_schema_extra=_setting("kokoro_tts", advanced=True),
+        description="Maximum queued speech requests before overload rejection.",
+    )
+    max_text_chars: int = Field(
+        4000, ge=1, le=50000,
+        json_schema_extra=_setting("kokoro_tts", advanced=True),
+        description="Maximum characters accepted in one speech request.",
     )
 
 

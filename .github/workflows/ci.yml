@@ -1,0 +1,68 @@
+# CI for jaeger-kokoro-tts.
+#
+# This repo shipped a release in which a directory rename deleted 92
+# lines of test coverage and nobody noticed, because nothing ran the
+# suite. That is the job here — not style, not coverage percentages.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The range pyproject declares. Both, because `requires-python`
+        # is a promise and an untested promise is a guess.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: install
+        # `[bootstrap]` because jaeger-os is not on PyPI and a runner is
+        # the "fresh machine with no framework" case that extra exists
+        # for. Order is not stylistic: requirements.txt opens with
+        # `jaeger-os>=0.10`, pip resolves all-or-nothing, so without the
+        # extra the pin fails and NONE of the engine dependencies land
+        # either — and the error blames the framework.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[bootstrap]"
+          pip install pytest
+
+      - name: pytest
+        # Model weights are ~330 MB from the Hugging Face Hub and there
+        # is no audio device on a runner. `model` and `slow` cover both;
+        # everything else — the bus contract, the drain protocol, the
+        # HF-offline decision, the module manifest — runs here, and
+        # those are the parts that break silently.
+        run: pytest -q -m "not model and not slow"
+
+      - name: module manifest resolves through the framework
+        # The one thing a green unit suite still cannot tell you: that
+        # JaegerOS can actually FIND this module and bind it to the tts
+        # slot. Discovery goes through an entry point, which only exists
+        # after a real install — so it is checkable here and nowhere in
+        # the unit tests.
+        run: |
+          python - <<'PY'
+          from jaeger_os import discover_modules
+          mods = discover_modules()
+          assert "tts" in mods, f"tts slot unclaimed; found {sorted(mods)}"
+          # slot -> LIST of specs; more than one module may claim a slot.
+          spec = next(s for s in mods["tts"]
+                      if s.factory == "jaeger_kokoro_tts:make_tts_node")
+          assert spec.consumes and spec.produces, "manifest declares no topics"
+          print(f"ok: tts <- {spec.module} {spec.version} ({spec.factory})")
+          PY

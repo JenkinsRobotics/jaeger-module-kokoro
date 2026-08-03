@@ -1,13 +1,8 @@
-"""Persistent output player for the Kokoro TTS plugin.
-
-Direct port of the working pattern from
-``dev/tools/audio_smoke/voice_assistant_persistent.py::PersistentPlayer``
-(and ``voice_assistant_avaudio.py::SessionPlayer``), adapted to live
-inside the plugin with backend selection.
+"""Persistent direct-device player for the standalone Kokoro CLI.
 
 Design notes
 ------------
-* ONE output stream opens at plugin warm / first speak() and stays
+* One output stream opens at warm / first speak() and stays
   alive for the whole session.  Closed at process shutdown.
 * Audio chunks come in via :meth:`enqueue`; the sounddevice backend
   feeds them through a callback queue, while the avaudio backend
@@ -22,9 +17,7 @@ Design notes
     - ``backend="avaudio"`` — PyObjC AVAudioEngine direct scheduling
       on ``AVAudioPlayerNode``.  Apple-native, no PortAudio in the
       loop, no worker-thread pacing.
-* Caller picks the backend via the ``audio_backend`` field on the
-  instance's ``voice`` config block (default: ``"sounddevice"`` since
-  step 1 proved it works end-to-end in the 0.2.6 TUI).
+* The caller chooses ``sounddevice`` or ``avaudio`` at construction.
 """
 
 from __future__ import annotations
@@ -378,6 +371,15 @@ class PersistentKokoroPlayer:
         """Stop current playback without closing the persistent stream."""
         self.reset()
 
+    def begin(self, correlation_id: str | None = None) -> None:
+        """Start one utterance.
+
+        Correlation is meaningful only for the bus player.  Keeping the
+        method here gives both playback backends one small, explicit
+        interface and avoids backend branches in the synthesis engine.
+        """
+        del correlation_id
+
     def is_open(self) -> bool:
         if self.backend == "avaudio":
             return bool(self._running and self._engine is not None
@@ -468,7 +470,7 @@ class PersistentKokoroPlayer:
             self._scheduled_count += 1
             self._drained.clear()
 
-        def _on_done() -> None:
+        def _on_done(_callback_type: Any) -> None:
             _ = pcm  # capture the PCM buffer for the callback lifetime
             with self._drain_lock:
                 self._drained_count += 1
@@ -481,10 +483,14 @@ class PersistentKokoroPlayer:
 
         self._pending_callbacks.append(_on_done)
         try:
-            # 2-arg scheduleBuffer:completionHandler:.  The 4-arg
-            # atTime/options form crashes PyObjC signature inference
-            # on macOS 26.
-            self._player.scheduleBuffer_completionHandler_(pcm, _on_done)
+            # DataPlayedBack is deliberately used for the utterance drain
+            # signal. DataRendered is correct for refill pacing, but an ack
+            # must include downstream device latency as well.
+            self._player.scheduleBuffer_completionCallbackType_completionHandler_(
+                pcm,
+                self._av.AVAudioPlayerNodeCompletionDataPlayedBack,
+                _on_done,
+            )
         except Exception:
             with self._drain_lock:
                 self._scheduled_count -= 1

@@ -9,7 +9,7 @@
 # satisfies it, pip says so plainly and setup.sh (or the README) says
 # where to get it: JaegerOS is not on PyPI yet.
 #
-#   pip install "jaeger-os>=0.10
+#   pip install "jaeger-os>=0.10"
 #
 # REQUIRES the hierarchical topic contract. Below 0.10 the topics this
 # module declares do not exist, and the failure is a node that

@@ -35,6 +35,8 @@ from typing import Any
 
 import numpy as np
 
+from jaeger_os.app.logging import log
+
 #: How long to keep waiting after the last chunk is sent before giving
 #: up on ever hearing "idle". Covers the driver's own buffering; long
 #: enough not to cut a sentence short, short enough that a missing
@@ -71,6 +73,12 @@ class BusPlayer:
         self._ended = threading.Event()
         self._sent_samples = 0
         self._subscribed = False
+        # Every utterance gets its own id.  Speaker state is shared by all
+        # audio producers (TTS, chimes, notifications), so accepting an
+        # unrelated "idle" edge would acknowledge speech that has not
+        # actually finished.
+        self._correlation_id: str | None = None
+        self.last_error: str | None = None
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -103,6 +111,19 @@ class BusPlayer:
         self._idle.set()
         self._ended.clear()
         self._sent_samples = 0
+        self.last_error = None
+
+    def begin(self, correlation_id: str | None = None) -> None:
+        """Start one logical utterance.
+
+        The id is copied onto every PCM message and matched against the
+        driver's completion signal.  ``None`` remains valid for standalone
+        callers that do not need request/reply correlation.
+        """
+        self._correlation_id = correlation_id
+        self.last_error = None
+        self._ended.clear()
+        self._sent_samples = 0
 
     # ── the audio path ───────────────────────────────────────────
 
@@ -125,6 +146,7 @@ class BusPlayer:
             samples=audio.tobytes(),
             sample_rate=self.samplerate,
             channels=self.channels,
+            correlation_id=self._correlation_id,
         ))
 
     def mark_end(self) -> None:
@@ -140,10 +162,11 @@ class BusPlayer:
         """
         from jaeger_os.transport import topics
         try:
-            self.bus.publish(topics.SpeakerStop())
+            self.bus.publish(topics.SpeakerStop(
+                correlation_id=self._correlation_id,
+            ))
         except Exception as exc:  # noqa: BLE001
-            print(f"[kokoro] speaker stop failed: {exc}",
-                  file=sys.stderr, flush=True)
+            log("kokoro", f"speaker stop failed: {exc}", level="warn")
         self._idle.set()
         self._sent_samples = 0
 
@@ -162,19 +185,28 @@ class BusPlayer:
         # missing driver hangs the speak() call forever.
         longest = self._sent_samples / float(self.samplerate) + DRAIN_GRACE_S
         drained = self._idle.wait(timeout=min(timeout, longest))
+        if drained and self.last_error is not None:
+            log("kokoro", f"speaker failed: {self.last_error}",
+                level="error")
+            return False
         if not drained:
-            print(
-                f"[kokoro] no drain signal on /act/speaker/state after "
+            log("kokoro",
+                f"no drain signal on /act/speaker/state after "
                 f"{min(timeout, longest):.1f}s — is the audio_io driver "
                 f"running? Publishing to an unconsumed topic succeeds "
-                f"silently.",
-                file=sys.stderr, flush=True)
+                f"silently.", level="warn")
         return drained
 
     # ── the driver talking back ──────────────────────────────────
 
     def _on_speaker_state(self, msg: Any) -> None:
-        if getattr(msg, "state", "") == "idle":
+        if getattr(msg, "correlation_id", None) != self._correlation_id:
+            return
+        state = getattr(msg, "state", "")
+        if state == "error":
+            self.last_error = getattr(msg, "error", None) or "speaker error"
+            self._idle.set()
+        elif state == "idle":
             self._idle.set()
 
 

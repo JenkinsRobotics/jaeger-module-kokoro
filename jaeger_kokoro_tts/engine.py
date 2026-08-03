@@ -1,22 +1,11 @@
-"""Kokoro TTS engine — synthesizes text via Kokoro KPipeline, plays through
-sounddevice (or AVAudioEngine — see ``persistent_player.py``).
+"""Kokoro speech synthesis for the JaegerOS ``tts`` slot.
 
-0.8 M1: this is the ``kokoro_tts`` engine-module's engine — moved here
-(verbatim, minus the wrapper docstring) from the old ``jaeger_os/plugins/
-kokoro_tts/`` plugin. The module IS the engine now: ``jaeger_os/nodes/
-kokoro_tts/`` owns the generic node (``node.py``), this engine, the
-persistent player, its own config slice (``config.py``), and its
-``module.yaml``. There's no separate "plugin" framing anymore — the
-agent-callable ``speak()`` tool (``agent/tools/speak.py``) talks to the
-``tts`` slot's node over the bus, which wraps whichever engine module is
-mounted there (today: this one).
+In an application this engine publishes 24 kHz mono PCM to JaegerOS's
+audio driver; the driver is the only component that opens the speaker.
+The standalone CLI may instead use the direct persistent player. Both
+paths share the same synthesis, cancellation, and drain behavior.
 
-When we deploy to robot hardware, this module graduates to a
-separate-process ZMQ node on the Jetson while the rest of the framework
-stays put — see ``jaeger_os/nodes/base.py``'s Node/Bus split.
-
-Public surface (consumed by ``node.py``'s ``Synthesizer`` Protocol via
-``runtime.py``'s ``_default_synth_factory``):
+Public surface (consumed by ``node.py``'s ``Synthesizer`` protocol):
   • KokoroTTS()              — lazy-loaded singleton in practice
   • .warm()                  — pre-load weights so the first speak() is fast
   • .speak(text)             — synthesize + play, returns result dict
@@ -32,6 +21,7 @@ import threading
 import time
 from typing import Any
 
+from jaeger_os.app.logging import log
 from jaeger_os.core.audio import FarEndReference
 
 
@@ -93,12 +83,10 @@ def ensure_hf_offline_if_cached(
         or hit is _CACHED_NO_EXIST
     ]
     if missing:
-        print(
-            f"[kokoro] NOT fully cached ({', '.join(missing)} missing for "
+        log("kokoro",
+            f"NOT fully cached ({', '.join(missing)} missing for "
             f"{repo_id!r}) — boot will fetch from Hugging Face Hub "
-            "(network required; one-time download).",
-            file=sys.stderr, flush=True,
-        )
+            "(network required; one-time download).", level="warn")
         return False
 
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -111,11 +99,12 @@ def ensure_hf_offline_if_cached(
         _hf_constants.HF_HUB_OFFLINE = True
     except Exception:  # noqa: BLE001 — env var alone still helps
         pass
-    print(
-        f"[kokoro] {repo_id!r} fully cached — forcing HF_HUB_OFFLINE "
-        "(no Hub freshness checks at boot).",
-        file=sys.stderr, flush=True,
-    )
+    # `info`, not `debug`: "is the network on my boot critical path?" is
+    # a once-per-boot fact an operator needs on a robot that may have no
+    # network at all. Its counterpart below (NOT fully cached) warns, so
+    # the two together always say which path boot took.
+    log("kokoro", f"{repo_id!r} fully cached — forcing HF_HUB_OFFLINE "
+        "(no Hub freshness checks at boot).")
     return True
 # ---------------------------------------------------------------------------
 # espeak-ng data-path length workaround (0.9 from-scratch-install fix).
@@ -190,11 +179,10 @@ def ensure_short_espeak_paths() -> None:
             os.replace(data_target_tmp, target_data)
             with open(marker, "w") as f:
                 f.write(lib_path)
-            print(
-                f"[kokoro] espeak-ng data path too long for the bundled "
+            log("kokoro",
+                f"espeak-ng data path too long for the bundled "
                 f"library's internal buffer ({len(data_path)} chars) — "
-                f"mirrored to {mirror!r}.",
-                file=sys.stderr, flush=True,
+                f"mirrored to {mirror!r}.", level="warn"
             )
 
     from phonemizer.backend.espeak.wrapper import EspeakWrapper
@@ -227,16 +215,20 @@ def clean_for_tts(text: str) -> str:
 
 def _resample_to_reference_rate(audio_f32):
     """Resample Kokoro's 24 kHz output to the AEC reference sample rate
-    (16 kHz). Polyphase keeps the voice band intact and adds well under
-    a millisecond of latency."""
+    (16 kHz). This is an echo reference rather than output audio, so linear
+    interpolation is sufficient and avoids making SciPy a hidden runtime
+    dependency."""
     import numpy as np
-    from scipy.signal import resample_poly
 
     if audio_f32.size == 0:
         return np.zeros(0, dtype=np.float32)
     if KOKORO_SAMPLE_RATE == REFERENCE_SAMPLE_RATE:
         return audio_f32.astype(np.float32, copy=False)
-    return resample_poly(audio_f32, up=REFERENCE_SAMPLE_RATE, down=KOKORO_SAMPLE_RATE).astype(np.float32)
+    n = int(round(audio_f32.size * REFERENCE_SAMPLE_RATE / KOKORO_SAMPLE_RATE))
+    positions = np.linspace(0, audio_f32.size - 1, n, dtype=np.float64)
+    return np.interp(
+        positions, np.arange(audio_f32.size), audio_f32,
+    ).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -273,18 +265,12 @@ def _ssml_segments(text: str):
 
 
 class KokoroTTS:
-    """Lazy-loaded Kokoro pipeline + sounddevice playback.
+    """Lazy-loaded Kokoro pipeline with interruptible playback.
 
-    Single-instance in practice — `core/tools/speak.py` caches one in a
-    module global. Thread-safety is intentionally minimal: Kokoro's pipeline
-    is not designed for concurrent calls, and the agent's tool surface is
-    serialized through the LLM lock anyway — EXCEPT for pipeline *loading*
-    itself (0.8.1: voice warm now runs off the boot critical path in a
-    background thread — see main.py's ``warm_plugins_async``), which can
-    race a real-time ``speak()`` call landing before warm finishes. That one
-    section (``_ensure_pipeline``) is guarded by ``_pipeline_lock`` so a
-    concurrent caller blocks and waits for the in-flight load instead of
-    starting a second one — "wait gracefully," never wedge or double-load.
+    The node serializes speech requests. Warm-up may still overlap the first
+    request, so model and player initialization each have their own lock.
+    ``stop()`` is intentionally lock-free: a bus callback must be able to
+    interrupt the active utterance while ``speak()`` is blocked.
     """
 
     def __init__(
@@ -299,29 +285,11 @@ class KokoroTTS:
         self.lang = lang
         self._pipeline: Any = None
         self._pipeline_lock = threading.Lock()
-        # AEC decoupling (0.9): this engine IMPLEMENTS the
-        # jaeger_os.core.audio.FarEndReference seam by writing every
-        # played frame into whatever buffer is set here — it never
-        # knows or cares whether an STT engine is even installed, let
-        # alone which one. ``jaeger_os/nodes/runtime.py`` is what
-        # creates the buffer and assigns it here (discovery-driven,
-        # only when barge-in + AEC are actually wanted); left ``None``
-        # this engine simply doesn't publish a far-end reference and
-        # plain set_paused()-based playback still works.
         self.bus = bus
         # Only used on the no-bus path. With a bus, the audio_io driver
         # writes its own AEC reference from what it actually plays,
         # which is both simpler and more accurate than us guessing.
         self.reference_buffer = reference_buffer
-        # 0.3.0-refactor step 1+2: ONE long-lived output stream for the
-        # whole TTS lifetime.  Backend chosen at runtime from
-        # ``config.voice.audio_backend`` (default "sounddevice"):
-        #   - "sounddevice" : PortAudio path proven by
-        #     dev/tools/audio_smoke/voice_assistant_persistent.py
-        #   - "avaudio"     : AVAudioEngine path proven by
-        #     dev/tools/audio_smoke/voice_assistant_avaudio.py
-        # Lazy-opened by ``_ensure_player`` from ``warm()``; closed by
-        # ``shutdown()`` at TUI exit.
         # With a bus: publish to /act/speaker/pcm and let the audio_io
         # driver own the device. Without one: open the device directly,
         # which is what dev tools and benches do.
@@ -332,11 +300,19 @@ class KokoroTTS:
             from .persistent_player import PersistentKokoroPlayer
             self._PlayerCls = PersistentKokoroPlayer
         self._player: Any = None
+        # Same reason ``_pipeline_lock`` exists, for the other half of
+        # warm(): background warm and a real-time speak() both call
+        # ``_ensure_player``, and unguarded they open TWO output
+        # streams — the loser stays subscribed to /act/speaker/state
+        # forever (and on the no-bus path holds a second device).
+        self._player_lock = threading.Lock()
         # Operator can override the config-default backend at runtime
         # via ``JAEGER_AUDIO_BACKEND`` for quick A/B testing without
         # editing config.yaml.  Falls through to the config / "sounddevice"
         # default in :meth:`_resolve_backend`.
         self._backend_override = os.environ.get("JAEGER_AUDIO_BACKEND")
+        self._cancel = threading.Event()
+        self._shutdown = threading.Event()
 
     def _resolve_backend(self) -> str:
         """Pick the audio backend for the persistent player.
@@ -359,33 +335,55 @@ class KokoroTTS:
             candidate = "sounddevice"
         from .persistent_player import PersistentKokoroPlayer
         if candidate not in PersistentKokoroPlayer.SUPPORTED_BACKENDS:
-            print(
-                f"[kokoro] unknown audio_backend {candidate!r}; "
-                f"falling back to 'sounddevice'",
-                file=sys.stderr, flush=True,
-            )
+            log("kokoro", f"unknown audio_backend {candidate!r}; "
+                f"falling back to 'sounddevice'", level="warn")
             return "sounddevice"
         return candidate
 
     # ── persistent player lifecycle ───────────────────────────────────
     def _ensure_player(self) -> Any:
         """Open the persistent output stream if it isn't already.
-        Idempotent; safe to call from warm() AND from the first speak()."""
+        Idempotent; safe to call from warm() AND from the first speak()
+        — including concurrently, which background warm makes routine.
+        Double-checked like ``_ensure_pipeline``: the second caller
+        waits for the first's open instead of racing it."""
+        if self._shutdown.is_set():
+            raise RuntimeError("Kokoro engine is shutting down")
         if self._player is not None and self._player.is_open():
             return self._player
-        backend = self._resolve_backend()
-        kwargs = dict(backend=backend, samplerate=KOKORO_SAMPLE_RATE,
-                      channels=1)
-        if self.bus is not None:
-            kwargs["bus"] = self.bus
-            kwargs["backend"] = "bus"
-        self._player = self._PlayerCls(**kwargs)
-        self._player.start()
-        print(f"[kokoro] persistent output stream open → "
-              f"backend={backend!r} device={self._player.device_index} "
-              f"name={self._player.device_name!r}",
-              file=sys.stderr, flush=True)
-        return self._player
+        with self._player_lock:
+            if self._shutdown.is_set():
+                raise RuntimeError("Kokoro engine is shutting down")
+            if self._player is not None and self._player.is_open():
+                return self._player
+            if self.bus is not None:
+                # A chassis/app-injected bus is an architectural boundary:
+                # this engine publishes PCM and must never resolve or open a
+                # local hardware backend. AudioIONode is the sole device
+                # owner for the application.
+                backend = "bus"
+                kwargs = dict(
+                    bus=self.bus,
+                    backend=backend,
+                    samplerate=KOKORO_SAMPLE_RATE,
+                    channels=1,
+                )
+            else:
+                # Standalone render/dev use only. Production node factories
+                # always inject their app bus above.
+                backend = self._resolve_backend()
+                kwargs = dict(
+                    backend=backend,
+                    samplerate=KOKORO_SAMPLE_RATE,
+                    channels=1,
+                )
+            player = self._PlayerCls(**kwargs)
+            player.start()
+            self._player = player
+            log("kokoro", f"persistent output stream open → "
+                f"backend={backend!r} device={player.device_index} "
+                f"name={player.device_name!r}", level="ok")
+            return player
 
     def shutdown(self) -> None:
         """Release the persistent player.  Called from the TUI's
@@ -393,13 +391,15 @@ class KokoroTTS:
         BEFORE Python's interpreter shutdown starts tearing things
         down (avoids the PortAudio-at-Pa_Terminate segfault that bit
         plain 0.2.6).  Idempotent."""
-        if self._player is None:
-            return
-        try:
-            self._player.close()
-        except Exception:  # noqa: BLE001
-            pass
-        self._player = None
+        self._shutdown.set()
+        self._cancel.set()
+        with self._player_lock:
+            player, self._player = self._player, None
+        if player is not None:
+            try:
+                player.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── pipeline lifecycle ────────────────────────────────────────────
     def _ensure_pipeline(self) -> Any:
@@ -492,6 +492,10 @@ class KokoroTTS:
                     "load_s": round(load_s, 3),
                     "prime_s": round(prime_s, 3)}
 
+        if self._shutdown.is_set():
+            return {"warmed": False, "reason": "shutdown requested",
+                    "load_s": round(load_s, 3), "prime_s": 0.0}
+
         # Stage 2 — open the persistent OutputStream in the clean
         # post-model-load window.  Failure here is non-fatal: speak()
         # will retry on first use (and surface the error in the result
@@ -501,11 +505,12 @@ class KokoroTTS:
             self._ensure_player()
             player_device = self._player.device_name if self._player else None
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"[kokoro] persistent player warm failed ({exc}); "
-                "will retry on first speak()",
-                file=sys.stderr, flush=True,
-            )
+            log("kokoro", f"persistent player warm failed ({exc}); "
+                "will retry on first speak()", level="warn")
+
+        if self._shutdown.is_set():
+            return {"warmed": False, "reason": "shutdown requested",
+                    "load_s": round(load_s, 3), "prime_s": 0.0}
 
         # Stage 3 — REAL primer synthesis (PyTorch MPS warm-up).
         try:
@@ -535,7 +540,32 @@ class KokoroTTS:
         }
 
     # ── synthesis + playback ──────────────────────────────────────────
-    def _synthesize(self, text: str) -> tuple[Any, bool]:
+    def render(self, text: str):
+        """Text -> a float32 mono buffer at :data:`KOKORO_SAMPLE_RATE`,
+        opening no audio device.  ``None`` for empty input.
+
+        The public face of ``_synthesize``. ``speak`` also plays audio,
+        which makes it unsuitable on a machine with no speaker — a build box,
+        a container, an SSH session — and unusable for the obvious
+        non-talking thing Kokoro is good for: writing a wav.  Markdown
+        stripping and SSML are applied exactly as in ``speak``, because
+        a rendered file that differed from what you hear would be a
+        trap rather than a feature.
+        """
+        cleaned = clean_for_tts(text)
+        if not cleaned:
+            return None
+        audio, _ = self._synthesize(cleaned)
+        return audio
+
+    def _synthesize(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        rate: float = 1.0,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[Any, bool]:
         """Render the text to a single float32 audio buffer. Returns
         (audio, has_ssml). Caller is responsible for playback."""
         import numpy as np
@@ -550,7 +580,9 @@ class KokoroTTS:
         if has_ssml:
             for kind, value in _ssml_segments(text):
                 if kind == "text":
-                    for r in pipe(value, voice=self.voice):
+                    for r in pipe(value, voice=voice or self.voice, speed=rate):
+                        if cancel_event is not None and cancel_event.is_set():
+                            return None, has_ssml
                         if r.audio is not None:
                             chunks.append(np.asarray(r.audio, dtype=np.float32))
                 else:
@@ -558,47 +590,73 @@ class KokoroTTS:
                     if n > 0:
                         chunks.append(np.zeros(n, dtype=np.float32))
         else:
-            for r in pipe(text, voice=self.voice):
+            for r in pipe(text, voice=voice or self.voice, speed=rate):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None, has_ssml
                 if r.audio is not None:
                     chunks.append(np.asarray(r.audio, dtype=np.float32))
         if not chunks:
             return None, has_ssml
         return np.concatenate(chunks), has_ssml
 
-    def speak(self, text: str) -> dict[str, Any]:
+    def speak(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        rate: float = 1.0,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Synthesize speech with Kokoro and play through the persistent
         sounddevice output.  Supports minimal SSML: <speak>,
         <break time="Xms"/>, <breath/>.
 
-        Streams chunks through the persistent player AS Kokoro produces
-        them — chunk N starts playing while chunk N+1 is still being
-        synthesized.  Blocks until playback finishes.  Markdown
-        (``**bold**``, code fences, link syntax) is stripped before
-        synthesis.
+        On the direct-device path, streams chunks through the persistent
+        player as Kokoro produces them.  On the JaegerOS bus path, renders
+        the complete utterance before publishing it.  The audio driver
+        cannot distinguish an inter-chunk synthesis pause from the end of
+        an utterance, so publishing generator chunks individually can make
+        it close a high-latency device before any sound reaches the
+        speakers.  Blocks until playback finishes.  Markdown (``**bold**``,
+        code fences, link syntax) is stripped before synthesis.
 
-        0.3.0-refactor (step 1): rewritten to mirror the working
-        ``voice_assistant_persistent.py`` pattern — one long-lived
-        OutputStream + chunk queue, no per-utterance device open/close.
-        Replaces the old _synthesize → sd.play() per call path which
-        was producing PortAudio errors + exit segfaults on macOS 26.5.
+        ``voice`` and ``rate`` are request-local overrides. The configured
+        pipeline language remains fixed, so the voice must be compatible
+        with that language.
         """
         import numpy as np
 
         cleaned = clean_for_tts(text)
         if not cleaned:
             return {"spoken": False, "reason": "empty text"}
+        if not 0.5 <= float(rate) <= 2.0:
+            return {
+                "spoken": False,
+                "reason": "rate must be between 0.5 and 2.0",
+            }
+
+        # A new event keeps a late stop for one request from cancelling the
+        # next request in the node's queue.
+        self._cancel = threading.Event()
 
         started = time.perf_counter()
         try:
             player = self._ensure_player()
+            player.begin(correlation_id)
         except Exception as exc:  # noqa: BLE001
             return {
                 "spoken": False,
                 "reason": f"player open failed: {exc}",
                 "text": cleaned,
             }
-
-        pipe = self._ensure_pipeline()
+        try:
+            pipe = self._ensure_pipeline()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "spoken": False,
+                "reason": f"pipeline load failed: {exc}",
+                "text": cleaned,
+            }
         has_ssml = (
             "<break" in cleaned.lower()
             or "<breath" in cleaned.lower()
@@ -608,11 +666,9 @@ class KokoroTTS:
         queued_samples = 0
 
         def _enqueue_chunk(chunk_24k: np.ndarray) -> None:
-            """Push to player AND to the AEC far-end buffer (so STT
-            can suppress our own voice).  Mirrors the chunk routing
-            from play_async()."""
+            """Queue one chunk and mirror it to direct-path AEC."""
             nonlocal queued_samples
-            if chunk_24k.size == 0:
+            if chunk_24k.size == 0 or self._cancel.is_set():
                 return
             # On the bus path the driver writes its own reference from
             # what it actually plays; writing one here as well would
@@ -627,10 +683,30 @@ class KokoroTTS:
             queued_samples += int(chunk_24k.size)
 
         try:
-            if has_ssml:
+            if self.bus is not None:
+                # A bus AudioOutFrame is an independently deliverable unit;
+                # there is currently no separate "more chunks are coming"
+                # marker in that contract.  Keep the utterance contiguous so
+                # audio_io's empty-source state means the real end, rather
+                # than a temporary pause while Kokoro generates its next
+                # result.  This also matches the proven JP01/CC01 pipeline.
+                rendered, has_ssml = self._synthesize(
+                    cleaned,
+                    voice=voice,
+                    rate=rate,
+                    cancel_event=self._cancel,
+                )
+                if rendered is not None and not self._cancel.is_set():
+                    _enqueue_chunk(
+                        np.asarray(rendered, dtype=np.float32))
+            elif has_ssml:
                 for kind, value in _ssml_segments(cleaned):
                     if kind == "text":
-                        for r in pipe(value, voice=self.voice):
+                        for r in pipe(
+                            value, voice=voice or self.voice, speed=rate,
+                        ):
+                            if self._cancel.is_set():
+                                break
                             if r.audio is None:
                                 continue
                             _enqueue_chunk(
@@ -640,7 +716,11 @@ class KokoroTTS:
                         if n > 0:
                             _enqueue_chunk(np.zeros(n, dtype=np.float32))
             else:
-                for r in pipe(cleaned, voice=self.voice):
+                for r in pipe(
+                    cleaned, voice=voice or self.voice, speed=rate,
+                ):
+                    if self._cancel.is_set():
+                        break
                     if r.audio is None:
                         continue
                     _enqueue_chunk(np.asarray(r.audio, dtype=np.float32))
@@ -649,6 +729,14 @@ class KokoroTTS:
                 "spoken": False,
                 "reason": f"synthesis failed: {exc}",
                 "text": cleaned,
+            }
+
+        if self._cancel.is_set():
+            return {
+                "spoken": False,
+                "reason": "interrupted",
+                "text": cleaned,
+                "samples": queued_samples,
             }
 
         if queued_samples == 0:
@@ -672,7 +760,7 @@ class KokoroTTS:
                 self._player = None
             return {
                 "spoken": False,
-                "reason": "drain timeout",
+                "reason": getattr(player, "last_error", None) or "drain timeout",
                 "text": cleaned,
                 "samples": queued_samples,
             }
@@ -687,271 +775,20 @@ class KokoroTTS:
             "device": player.device_name,
         }
 
-    # ── async playback (for barge-in) ─────────────────────────────────
-    def play_async(self, text: str) -> dict[str, Any]:
-        """Like speak(), but returns immediately and supports interruption.
-
-        Kicks off a synthesis thread that streams Kokoro generator chunks
-        into the persistent player. Each chunk is pushed to playback AS
-        IT'S SYNTHESIZED, not after the whole utterance is rendered — so
-        the user can interrupt during synthesis, not just during playback.
-
-        AEC reference audio is resampled from 24 kHz down to 16 kHz before
-        being pushed to the reference buffer (which the STT-side AEC reads
-        at 16 kHz, the mic's native rate).
-
-        Markdown stripping is applied before synthesis.
-
-        Returns synthesis metadata. To know when playback actually ends,
-        poll `is_playing()` or call `wait_until_done()`.
-        """
-        import numpy as np
-        import threading
-
-        cleaned = clean_for_tts(text)
-        if not cleaned:
-            return {"started": False, "reason": "empty text"}
-
-        synth_started = time.perf_counter()
-        try:
-            player = self._ensure_player()
-        except Exception as exc:  # noqa: BLE001
-            return {"started": False, "reason": f"player open failed: {exc}"}
-
-        # Fresh per-utterance cancel flag — set() to stop both synthesis
-        # and playback. Threads check it between chunks.
-        self._cancel = threading.Event()
-        self._stream_done = threading.Event()
-        self._async_player = player
-        queued_samples = {"n": 0}
-
-        def _enqueue_async_chunk(chunk_24k: np.ndarray) -> None:
-            if chunk_24k.size == 0 or self._cancel.is_set():
-                return
-            if self.reference_buffer is not None:
-                try:
-                    ref = _resample_to_reference_rate(chunk_24k)
-                    self.reference_buffer.write(ref)
-                except Exception:  # noqa: BLE001
-                    pass
-            player.enqueue(chunk_24k)
-            queued_samples["n"] += int(chunk_24k.size)
-
-        # Synthesis worker — runs in its own thread so play_async() returns.
-        def _synth_loop() -> None:
-            pipe = self._ensure_pipeline()
-            try:
-                has_ssml = (
-                    "<break" in cleaned.lower()
-                    or "<breath" in cleaned.lower()
-                    or "<speak" in cleaned.lower()
-                )
-                if has_ssml:
-                    for kind, value in _ssml_segments(cleaned):
-                        if self._cancel.is_set():
-                            return
-                        if kind == "text":
-                            for r in pipe(value, voice=self.voice):
-                                if self._cancel.is_set():
-                                    return
-                                if r.audio is None:
-                                    continue
-                                _enqueue_async_chunk(
-                                    np.asarray(r.audio, dtype=np.float32))
-                        else:
-                            n = int(KOKORO_SAMPLE_RATE * value / 1000)
-                            if n > 0:
-                                _enqueue_async_chunk(
-                                    np.zeros(n, dtype=np.float32))
-                else:
-                    for r in pipe(cleaned, voice=self.voice):
-                        if self._cancel.is_set():
-                            return
-                        if r.audio is None:
-                            continue
-                        _enqueue_async_chunk(
-                            np.asarray(r.audio, dtype=np.float32))
-            finally:
-                if not self._cancel.is_set() and queued_samples["n"] > 0:
-                    player.mark_end()
-                    if not player.wait_until_drained():
-                        try:
-                            player.reset()
-                        except Exception:  # noqa: BLE001
-                            pass
-                self._stream_done.set()
-
-        self._synth_thread = threading.Thread(
-            target=_synth_loop, daemon=True, name="kokoro-synth",
-        )
-        self._synth_thread.start()
-
-        return {
-            "started": True,
-            "text": cleaned,
-            "chars": len(cleaned),
-            "synth_started_s": round(time.perf_counter() - synth_started, 3),
-            "device": player.device_name,
-        }
-
-    def _close_stream(self) -> None:
-        """Close the legacy async stream if one exists.
-
-        Kept as a compatibility cleanup hook for sessions created by
-        older code paths before 0.3.0 switched async playback to the
-        persistent player.
-        """
-        s = getattr(self, "_stream", None)
-        if s is not None:
-            try:
-                s.stop()
-                s.close()
-            except Exception:
-                pass
-            self._stream = None
-
     def stop(self) -> None:
-        """Stop async playback immediately. Drops the queue, signals
-        synthesis to bail, closes the output stream, and clears AEC
-        reference. Idempotent."""
-        cancel = getattr(self, "_cancel", None)
-        if cancel is not None:
-            cancel.set()
-        player = getattr(self, "_async_player", None) or self._player
+        """Interrupt synthesis/playback without closing the persistent path.
+
+        Called from the bus delivery thread for barge-in and from node
+        shutdown. Setting the event is non-blocking; the active synthesis
+        loop observes it between chunks, while the player immediately drops
+        audio already queued at the speaker.
+        """
+        self._cancel.set()
+        player = self._player
         if player is not None:
             try:
                 player.cancel()
             except Exception:  # noqa: BLE001
                 pass
-        self._close_stream()
-        done = getattr(self, "_stream_done", None)
-        if done is not None:
-            done.set()
         if self.reference_buffer is not None:
             self.reference_buffer.clear()
-
-    def is_playing(self) -> bool:
-        """True while async playback is active (chunks still queued or
-        playing). Polled by the voice loop to know when an async speak
-        has finished naturally."""
-        s = getattr(self, "_stream", None)
-        synth = getattr(self, "_synth_thread", None)
-        if synth is not None and synth.is_alive():
-            return True
-        done = getattr(self, "_stream_done", None)
-        if done is not None and not done.is_set():
-            return True
-        if s is None:
-            return False
-        try:
-            return bool(s.active)
-        except Exception:
-            return False
-
-    def wait_until_done(self) -> None:
-        """Block until async playback finishes naturally (or stop() is called)."""
-        done = getattr(self, "_stream_done", None)
-        if done is None:
-            return
-        done.wait(timeout=120.0)
-        self._close_stream()
-
-
-def _resolve_live_device(sd) -> int | None:
-    """Re-query the current system default output device each call so
-    AirPods/Speakers swaps work mid-session."""
-    try:
-        info = sd.query_devices(kind="output")
-        if isinstance(info, dict) and "index" in info:
-            return int(info["index"])
-    except Exception:
-        pass
-    return None
-
-
-def _bounded_play(sd, audio, *, device, samplerate):
-    """Call ``sd.play`` + ``sd.wait`` with a wall-clock timeout.
-
-    0.2.6: ``sd.wait()`` blocks indefinitely. When CoreAudio loses the
-    backing device mid-stream (the ``PaMacCore (AUHAL) Error on line
-    2747 ... Unspecified Audio Hardware Error`` case), the callback
-    thread stops draining but ``wait()`` never returns. The TTS tool
-    call hangs, the agent loop blocks because tools are synchronous,
-    and the operator's interrupts / steers queue but can't fire until
-    the tool comes back. Symptom: ``> tool : text_to_speech`` clock
-    climbs past 60s and the TUI is unresponsive.
-
-    Bound the wait to ``audio_length + 5s`` (5s of slop for buffer
-    drain). If we hit the cap, call ``sd.stop()`` to force-cancel and
-    raise so the outer ``except`` triggers the reinit path. Worst
-    case: a TTS line gets cut a few seconds early — far better than
-    hanging the agent.
-    """
-    sd.play(audio, samplerate=samplerate, device=device)
-    audio_len_s = len(audio) / float(samplerate)
-    timeout_s = max(2.0, audio_len_s + 5.0)
-    import time as _time
-    deadline = _time.monotonic() + timeout_s
-    while True:
-        active = False
-        try:
-            stream = getattr(sd, "_last_callback", None)
-            active = bool(stream and stream.stream and stream.stream.active)
-        except Exception:
-            active = False
-        if not active:
-            return
-        if _time.monotonic() > deadline:
-            try:
-                sd.stop()
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"sd.wait() exceeded {timeout_s:.1f}s for "
-                f"{audio_len_s:.1f}s of audio — likely a hung CoreAudio "
-                f"stream (PaMacCore AUHAL). Aborted playback."
-            )
-        _time.sleep(0.05)
-
-
-def _play_audio_with_live_device(sd, audio, reference_buffer=None):
-    """Synchronous play. Pushes audio to the AEC reference buffer (if
-    supplied) so STT can cancel echo even on sync paths."""
-    # Reference push happens BEFORE play() so the far-end is available
-    # the moment the mic callback might fire. Stale reference is fine.
-    if reference_buffer is not None:
-        try:
-            reference_buffer.write(audio)
-        except Exception:
-            pass
-
-    device = _resolve_live_device(sd)
-    try:
-        _bounded_play(sd, audio, device=device, samplerate=KOKORO_SAMPLE_RATE)
-        return device
-    except Exception as first_exc:
-        try:
-            sd.stop()
-        except Exception:
-            pass
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception:
-            pass
-        device = _resolve_live_device(sd)
-        try:
-            _bounded_play(sd, audio, device=device,
-                          samplerate=KOKORO_SAMPLE_RATE)
-            return device
-        except Exception as second_exc:
-            try:
-                sd.stop()
-            except Exception:
-                pass
-            return {
-                "spoken": False,
-                "reason": f"playback failed after reinit: {second_exc}",
-                "first_error": str(first_exc),
-                "device": device,
-            }

@@ -20,7 +20,7 @@ import pytest
 
 from jaeger_os.transport import InProcBus, topics
 
-from jaeger_kokoro_tts.nodes.kokoro_tts.bus_player import BusPlayer
+from jaeger_kokoro_tts.bus_player import BusPlayer
 
 
 @pytest.fixture
@@ -63,6 +63,32 @@ def test_enqueued_audio_is_published(bus):
         assert np.allclose(np.frombuffer(msg.samples, dtype=np.float32), 0.3)
         assert msg.sample_rate == 24000, "the driver resamples from this"
         assert msg.channels == 1
+    finally:
+        p.close()
+
+
+def test_pcm_and_drain_are_correlated_to_one_utterance(bus):
+    got = []
+    bus.subscribe(topics.ACT_SPEAKER_PCM, got.append)
+    p = _player(bus)
+    try:
+        p.begin("speech-42")
+        p.enqueue(np.zeros(240, dtype=np.float32))
+        assert _wait(lambda: got)
+        assert got[0].correlation_id == "speech-42"
+
+        # A notification finishing on the shared speaker must not complete
+        # this speech request.
+        bus.publish(topics.SpeakerState(
+            state="idle", correlation_id="notification-7",
+        ))
+        time.sleep(0.15)
+        assert not p._idle.is_set()
+
+        bus.publish(topics.SpeakerState(
+            state="idle", correlation_id="speech-42",
+        ))
+        assert _wait(p._idle.is_set)
     finally:
         p.close()
 
@@ -144,6 +170,24 @@ def test_a_missing_driver_times_out_instead_of_hanging(bus, capfd):
         assert elapsed < 12, f"hung for {elapsed:.1f}s waiting on nobody"
         err = capfd.readouterr().err
         assert "audio_io" in err, "the warning must name the missing driver"
+    finally:
+        p.close()
+
+
+def test_correlated_speaker_error_fails_the_drain_immediately(bus):
+    p = _player(bus)
+    try:
+        p.begin("speech-5")
+        p.enqueue(np.zeros(24000, dtype=np.float32))
+        bus.publish(topics.SpeakerState(
+            state="error",
+            error="output device disconnected",
+            correlation_id="speech-5",
+        ))
+        started = time.perf_counter()
+        assert p.wait_until_drained(timeout=10.0) is False
+        assert time.perf_counter() - started < 1.0
+        assert p.last_error == "output device disconnected"
     finally:
         p.close()
 

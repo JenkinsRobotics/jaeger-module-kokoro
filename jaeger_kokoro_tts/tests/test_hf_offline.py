@@ -1,6 +1,10 @@
 """``ensure_hf_offline_if_cached`` — 0.8.1 field bug #1: "boot never
 blocks on network".
 
+Deleted in the 0.12.0 flattening and restored here: the layout moved,
+the field bug did not. A robot booting on a congested or absent
+network is exactly the case this covers.
+
 Kokoro's own loader calls ``huggingface_hub.hf_hub_download()`` with no
 ``local_files_only=``, so every pipeline init does an unauthenticated
 HEAD request against the Hub even when every required file is already
@@ -17,7 +21,7 @@ import huggingface_hub
 import huggingface_hub.constants as hf_constants
 import pytest
 
-from jaeger_kokoro_tts.nodes.kokoro_tts import engine as kokoro_engine
+from jaeger_kokoro_tts import engine as kokoro_engine
 
 
 @pytest.fixture(autouse=True)

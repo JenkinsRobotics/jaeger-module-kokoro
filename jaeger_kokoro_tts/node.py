@@ -1,22 +1,10 @@
-"""tts.py — TTS node.  First Track B node.
+"""Bus-facing JaegerOS node for Kokoro speech synthesis.
 
-Wraps the existing in-process :class:`KokoroTTS` engine as a Bus-
-addressable node.  Subscribes to ``/act/speech/say`` (the brain's
-text-to-speech command topic), runs synthesis + playback on the
-node's own work thread, and publishes ``/act/speech/spoken`` as the ack
-the brain's ``text_to_speech`` tool will await (Track B.2).
-
-Why this is the right "first real node"
----------------------------------------
-* TTS has a clean request → ack shape — easiest demonstration of
-  the operator's "tools = networking, nodes = execution" contract.
-* The existing :class:`KokoroTTS` engine is proven (0.3.0 ships it).
-  We're wrapping it, not reimplementing.
-* No mic / STT involvement — half the audio pipeline isolated from
-  the change.
-* Doesn't touch the brain or voice loop in this commit; Track B.2
-  is the brain-side rewire (text_to_speech tool publishes /act/speech/say
-  via the bus instead of calling speak() in-process).
+The bus callback only validates and queues requests. Model inference and
+playback run serially on the node thread, so slow speech never blocks bus
+delivery for unrelated sensors or actuators. Every accepted request receives
+exactly one correlated :class:`SpokenAck`, including overload, shutdown, and
+engine-failure paths.
 
 Threading
 ---------
@@ -37,6 +25,7 @@ right away rather than waiting for a timeout.
 
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 import time
@@ -54,7 +43,14 @@ class Synthesizer(Protocol):
     pass a mock that records calls and returns canned results.
     """
 
-    def speak(self, text: str) -> dict[str, Any]:
+    def speak(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        rate: float = 1.0,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Synthesize + play ``text``; block until playback finishes.
         Returns a dict with at least ``spoken: bool``; may also carry
         ``elapsed_s``, ``reason`` (when ok=False), ``text`` (cleaned),
@@ -70,12 +66,8 @@ class Synthesizer(Protocol):
 class TTSNode(Node):
     """SUB ``/act/speech/say`` → synthesize → PUB ``/act/speech/spoken``.
 
-    The synthesizer is dependency-injected so tests can substitute a
-    mock without touching audio or model loading.  Production
-    instantiation lives in ``dev/scripts/tts_node_test.py`` (the
-    integration smoke) and at Track B.2 will move to the brain's
-    boot path so the ``text_to_speech`` tool can route through the
-    bus instead of calling KokoroTTS in-process.
+    The synthesizer is dependency-injected so another TTS engine can claim
+    the same slot without changing this request/ack lifecycle.
     """
 
     def __init__(
@@ -85,6 +77,8 @@ class TTSNode(Node):
         synthesizer: Synthesizer,
         name: str = "tts",
         queue_maxsize: int = 32,
+        max_text_chars: int = 4000,
+        warm_on_start: bool = True,
         install_signal_handlers: bool = False,
     ) -> None:
         super().__init__(
@@ -97,19 +91,39 @@ class TTSNode(Node):
         self._pending: "queue.Queue[topics.SpeechCommand]" = queue.Queue(
             maxsize=queue_maxsize,
         )
+        self._queue_maxsize = int(queue_maxsize)
+        self._max_text_chars = int(max_text_chars)
+        self._warm_on_start = bool(warm_on_start)
+        self._warm_thread: threading.Thread | None = None
+        self._warm_status = "disabled" if not warm_on_start else "pending"
         # Correlation id for the speech currently inside synthesizer.speak().
         # A SpeechStop carrying a different id is stale and must not cut a
         # newer utterance that happened to start after the operator's stop.
         self._active_correlation_id: str | None = None
+        self._requests = 0
+        self._completed = 0
+        self._failed = 0
+        self._rejected = 0
+        self._last_duration_s = 0.0
+        self._last_error: str | None = None
 
     # ── lifecycle ─────────────────────────────────────────────────
 
     def setup(self) -> None:
-        self.bus.subscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
-        self.bus.subscribe(topics.ACT_SPEECH_STOP, self._on_speech_stop)
+        self.subscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
+        self.subscribe(topics.ACT_SPEECH_STOP, self._on_speech_stop)
         self._log(
             f"subscribed to {topics.ACT_SPEECH_SAY} + {topics.ACT_SPEECH_STOP}"
         )
+        warm = getattr(self.synthesizer, "warm", None)
+        if self._warm_on_start and callable(warm):
+            self._warm_status = "warming"
+            self._warm_thread = threading.Thread(
+                target=self._warm_synthesizer,
+                name=f"{self.name}-warm",
+                daemon=True,
+            )
+            self._warm_thread.start()
 
     def tick(self) -> None:
         """Drain one queued speech request per tick.  Synthesis runs
@@ -122,22 +136,72 @@ class TTSNode(Node):
         self._handle(msg)
 
     def teardown(self) -> None:
-        try:
-            self.bus.unsubscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.bus.unsubscribe(
-                topics.ACT_SPEECH_STOP, self._on_speech_stop,
+        self.unsubscribe(topics.ACT_SPEECH_SAY, self._on_speech_command)
+        self.unsubscribe(topics.ACT_SPEECH_STOP, self._on_speech_stop)
+        # Do not strand callers whose accepted requests never started.
+        while True:
+            try:
+                pending = self._pending.get_nowait()
+            except queue.Empty:
+                break
+            self._publish_ack(
+                pending,
+                ok=False,
+                reason="TTS node stopping",
+                duration_s=0.0,
             )
-        except Exception:  # noqa: BLE001
-            pass
         if self.synthesizer is not None:
             try:
                 self.synthesizer.shutdown()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"synthesizer shutdown error: "
                           f"{type(exc).__name__}: {exc}")
+
+    def stop(self) -> None:
+        """Cancel active playback before waiting for the node thread.
+
+        ``Node.stop()`` only flips the loop flag. A TTS tick can block for
+        the duration of an utterance, so the synthesizer must also receive
+        an immediate cancellation signal during app shutdown.
+        """
+        stop = getattr(self.synthesizer, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"synthesizer stop error: {type(exc).__name__}: {exc}")
+        super().stop()
+
+    def health(self) -> dict[str, Any]:
+        health = super().health()
+        health.update({
+            "queue_depth": self._pending.qsize(),
+            "queue_capacity": self._queue_maxsize,
+            "active_correlation_id": self._active_correlation_id,
+            "requests": self._requests,
+            "completed": self._completed,
+            "failed": self._failed,
+            "rejected": self._rejected,
+            "last_duration_s": self._last_duration_s,
+            "last_error": self._last_error,
+            "warm_status": self._warm_status,
+            "voice": getattr(self.synthesizer, "voice", None),
+            "lang": getattr(self.synthesizer, "lang", None),
+        })
+        return health
+
+    def _warm_synthesizer(self) -> None:
+        try:
+            result = self.synthesizer.warm()
+            self._warm_status = (
+                "ready" if result.get("warmed", False) else "failed"
+            )
+            if self._warm_status == "failed":
+                self._last_error = str(result.get("reason") or "warm failed")
+        except Exception as exc:  # noqa: BLE001
+            self._warm_status = "failed"
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._log(f"warm failed: {self._last_error}")
 
     # ── subscriber + worker ──────────────────────────────────────
 
@@ -147,10 +211,36 @@ class TTSNode(Node):
         assert isinstance(msg, topics.SpeechCommand), (
             f"TTS node got unexpected topic: {msg.topic}"
         )
+        self._requests += 1
+        if not msg.text or not msg.text.strip():
+            self._rejected += 1
+            self._publish_ack(
+                msg, ok=False, reason="empty text", duration_s=0.0,
+            )
+            return
+        if len(msg.text) > self._max_text_chars:
+            self._rejected += 1
+            self._publish_ack(
+                msg,
+                ok=False,
+                reason=f"text exceeds {self._max_text_chars} characters",
+                duration_s=0.0,
+            )
+            return
+        if not 0.5 <= float(msg.rate) <= 2.0:
+            self._rejected += 1
+            self._publish_ack(
+                msg,
+                ok=False,
+                reason="rate must be between 0.5 and 2.0",
+                duration_s=0.0,
+            )
+            return
         try:
             self._pending.put_nowait(msg)
         except queue.Full:
             # Immediate-fail ack so the brain's tool sees rejection.
+            self._rejected += 1
             self._publish_ack(
                 msg, ok=False, reason="TTS queue full", duration_s=0.0,
             )
@@ -202,10 +292,8 @@ class TTSNode(Node):
     def _handle(self, msg: topics.SpeechCommand) -> None:
         t0 = time.perf_counter()
         self._active_correlation_id = msg.correlation_id
-        # 0.5 lip-sync proxy: emit /act/speech/chunk events at ~30 Hz
-        # while the synthesizer runs.  Amplitude is a sin-wave
-        # placeholder; real RMS sampling is a 0.5.x followup once
-        # Kokoro exposes streaming audio.
+        # Until the bus audio contract carries real per-chunk levels, publish
+        # a low-cost mouth-motion envelope while synthesis and playback run.
         amp_stop = threading.Event()
         cid_for_chunks = msg.correlation_id or ""
         amp_thread = threading.Thread(
@@ -216,11 +304,9 @@ class TTSNode(Node):
         )
         amp_thread.start()
         try:
-            result = self.synthesizer.speak(msg.text)
+            result = self._speak(msg)
         except Exception as exc:  # noqa: BLE001
             self._log(f"speak() raised: {type(exc).__name__}: {exc}")
-            amp_stop.set()
-            amp_thread.join(timeout=0.5)
             self._publish_ack(
                 msg, ok=False,
                 reason=f"{type(exc).__name__}: {exc}",
@@ -231,17 +317,17 @@ class TTSNode(Node):
             amp_stop.set()
             amp_thread.join(timeout=0.5)
             self._active_correlation_id = None
-        # Final 0-amplitude chunk so the face's mouth closes
-        # cleanly when the utterance ends.
-        try:
-            self.bus.publish(topics.TtsChunk(
-                amplitude=0.0,
-                is_final=True,
-                node_id=self.name,
-                correlation_id=cid_for_chunks,
-            ))
-        except Exception:  # noqa: BLE001
-            pass
+            # Always close the mouth, including inference exceptions and
+            # cancellation paths.
+            try:
+                self.publish(topics.TtsChunk(
+                    amplitude=0.0,
+                    is_final=True,
+                    node_id=self.name,
+                    correlation_id=cid_for_chunks,
+                ))
+            except Exception:  # noqa: BLE001
+                pass
         ok = bool(result.get("spoken", False))
         # Prefer the synthesizer's elapsed if it gives one (more
         # accurate — includes synth time, not just playback) but
@@ -252,6 +338,31 @@ class TTSNode(Node):
         reason = result.get("reason") if not ok else None
         self._publish_ack(msg, ok=ok, duration_s=duration_s, reason=reason)
 
+    def _speak(self, msg: topics.SpeechCommand) -> dict[str, Any]:
+        """Call the standard synthesizer API while tolerating old adapters.
+
+        ``Synthesizer`` now supports request-local voice, speed, and
+        correlation. Signature inspection keeps simple third-party engines
+        that still implement only ``speak(text)`` usable without catching a
+        real ``TypeError`` raised from inside their inference code.
+        """
+        speak = self.synthesizer.speak
+        parameters = inspect.signature(speak).parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in parameters.values()
+        )
+        values = {
+            "voice": msg.voice or None,
+            "rate": float(msg.rate),
+            "correlation_id": msg.correlation_id,
+        }
+        kwargs = {
+            key: value for key, value in values.items()
+            if accepts_kwargs or key in parameters
+        }
+        return speak(msg.text, **kwargs)
+
     def _tts_amplitude_pulse(
         self,
         stop_event: threading.Event,
@@ -260,11 +371,8 @@ class TTSNode(Node):
         """Emit ``/act/speech/chunk`` events at ~30 Hz with a sin
         amplitude shape until ``stop_event`` is set.
 
-        0.5.0 lip-sync proxy: not real audio sampling, but a
-        believable mouth-open/close cycle so Lilith looks like
-        she's saying something rather than staring blankly.  The
-        sin frequency (~5 Hz) approximates syllable rate; the
-        small jitter keeps it from looking mechanical.
+        This is a visual activity envelope, not measured PCM amplitude. The
+        final zero event is emitted by ``_handle`` on every exit path.
         """
         import math
         import random
@@ -277,7 +385,7 @@ class TTSNode(Node):
             jitter = random.uniform(-0.1, 0.1)
             amplitude = max(0.0, min(1.0, base * 0.7 + 0.15 + jitter))
             try:
-                self.bus.publish(topics.TtsChunk(
+                self.publish(topics.TtsChunk(
                     amplitude=amplitude,
                     is_final=False,
                     node_id=self.name,
@@ -295,7 +403,14 @@ class TTSNode(Node):
         duration_s: float,
         reason: str | None,
     ) -> None:
-        self.bus.publish(topics.SpokenAck(
+        self._last_duration_s = float(duration_s)
+        if ok:
+            self._completed += 1
+            self._last_error = None
+        else:
+            self._failed += 1
+            self._last_error = reason
+        self.publish(topics.SpokenAck(
             ok=ok,
             duration_s=duration_s,
             reason=reason,
