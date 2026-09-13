@@ -43,6 +43,13 @@ def test_manifest_validates_against_installed_jaeger_os() -> None:
     assert spec.slot == MANIFEST["slot"]
 
 
+def test_manifest_declares_stable_identity() -> None:
+    assert MANIFEST["id"] == "org.jenkinsrobotics.tts.kokoro"
+    assert MANIFEST["name"] == "JaegerKokoroTTS"
+    assert MANIFEST["type"] == "module"
+    assert MANIFEST["implementation"] == "kokoro"
+
+
 def test_manifest_factory_resolves() -> None:
     """A factory that does not import is a module that cannot boot."""
     dotted, _, attr = MANIFEST["factory"].partition(":")

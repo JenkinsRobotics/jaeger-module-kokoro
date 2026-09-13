@@ -12,14 +12,18 @@
 
 ---
 
+> **Jaeger ecosystem identity**
+> ID: `org.jenkinsrobotics.tts.kokoro` · Type: **module** ·
+> Slot: `tts` · Kind: `engine` · Implementation: `kokoro`
+
 ## What it is
 
 JaegerKokoroTTS is an **engine module** — the `tts` slot of the Jaeger
 ecosystem. The module IS the engine: this package owns the generic
 `TTSNode` + `Synthesizer` protocol, the real `KokoroTTS` engine, a
 persistent audio player, its own settings-catalog config slice, and its
-`module.yaml` manifest (module/slot/version/consumes/produces/tools/
-factory) — the seam
+`module.yaml` manifest (stable ID, type, implementation, slot, version,
+topics, tools, and factory) — the seam
 [`discover_modules()`](https://github.com/JenkinsRobotics/JaegerOS/blob/main/jaeger_os/core/modules.py)
 reads to bind a slot to this module at boot.
 

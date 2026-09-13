@@ -1,3 +1,7 @@
+id: org.jenkinsrobotics.tts.kokoro
+name: JaegerKokoroTTS
+type: module
+implementation: kokoro
 module: kokoro_tts
 slot: tts
 version: 2.0.0
