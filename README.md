@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/JenkinsRobotics/JaegerKokoroTTS/releases"><img src="https://img.shields.io/badge/version-0.12.0-2EA44F?style=for-the-badge" alt="Version"></a>
+  <a href="https://github.com/JenkinsRobotics/jaeger-module-kokoro/releases"><img src="https://img.shields.io/badge/version-0.12.0-2EA44F?style=for-the-badge" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2EA44F?style=for-the-badge" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+">
 </p>
@@ -55,7 +55,7 @@ consumers today: the JaegerAI product and JP01's non-AI console.
 ## Install
 
 ```bash
-git clone https://github.com/JenkinsRobotics/JaegerKokoroTTS.git
+git clone https://github.com/JenkinsRobotics/jaeger-module-kokoro.git
 cd JaegerKokoroTTS
 pip install -e .
 ```
@@ -200,7 +200,7 @@ rather than duplicated.
 | [JaegerOS](https://github.com/JenkinsRobotics/JaegerOS) | Framework | Bus, node, modules/slots, supervisor, safety, contract, capability layer. This repo pins it, only it. |
 | [JaegerAI](https://github.com/JenkinsRobotics/JaegerAI) | Mind (product) | Installs this module as an optional extra for voice. |
 | **JaegerKokoroTTS** | Engine module (`tts` slot) | This repo. |
-| [JaegerWhisperSTT](https://github.com/JenkinsRobotics/JaegerWhisperSTT) | Engine module (`stt` slot) | The listening sibling — same discipline, own repo. |
+| [JaegerWhisperSTT](https://github.com/JenkinsRobotics/jaeger-module-whisper) | Engine module (`stt` slot) | The listening sibling — same discipline, own repo. |
 | JP01 | Project (Body) | Consumes this module directly for its non-AI console. |
 
 Two more repos round out the ecosystem without being part of the tier map
